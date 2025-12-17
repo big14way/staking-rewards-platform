@@ -1,0 +1,38 @@
+{
+  "chain": "stacks",
+  "uuid": "staking-events-tracker",
+  "name": "Staking Rewards Pool Event Tracker",
+  "version": 1,
+  "networks": {
+    "testnet": {
+      "if_this": {
+        "scope": "print_event",
+        "contract_identifier": "YOUR_DEPLOYER_ADDRESS.staking-core",
+        "contains": "event"
+      },
+      "then_that": {
+        "http_post": {
+          "url": "http://localhost:3004/api/staking-events",
+          "authorization_header": "Bearer YOUR_AUTH_TOKEN"
+        }
+      },
+      "start_block": 1,
+      "decode_clarity_values": true
+    },
+    "mainnet": {
+      "if_this": {
+        "scope": "print_event",
+        "contract_identifier": "YOUR_MAINNET_ADDRESS.staking-core",
+        "contains": "event"
+      },
+      "then_that": {
+        "http_post": {
+          "url": "https://your-api.com/api/staking-events",
+          "authorization_header": "Bearer YOUR_AUTH_TOKEN"
+        }
+      },
+      "start_block": 1,
+      "decode_clarity_values": true
+    }
+  }
+}
