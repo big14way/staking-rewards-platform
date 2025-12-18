@@ -596,3 +596,4 @@
 (define-data-var staking-var-1 uint u1)
 (define-data-var staking-var-2 uint u2)
 (define-data-var staking-var-3 uint u3)
+(define-data-var staking-var-4 uint u4)
