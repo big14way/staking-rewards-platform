@@ -593,3 +593,4 @@
         (map-set pools pool-id (merge pool { status: POOL_ACTIVE }))
         (print { event: "pool-resumed", pool-id: pool-id, timestamp: stacks-block-time })
         (ok true)))
+(define-data-var staking-var-1 uint u1)
