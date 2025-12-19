@@ -12,6 +12,7 @@
 (define-constant ERR_COOLDOWN_ACTIVE (err u23005))
 (define-constant ERR_POOL_INACTIVE (err u23006))
 (define-constant ERR_NO_REWARDS (err u23007))
+(define-constant ERR_TIER_NOT_FOUND (err u23008))
 
 ;; Pool status
 (define-constant POOL_ACTIVE u0)
@@ -28,6 +29,17 @@
 ;; Early withdrawal penalty: 5%
 (define-constant EARLY_WITHDRAWAL_FEE_BPS u500)
 
+;; Loyalty tiers
+(define-constant TIER_BRONZE u0)
+(define-constant TIER_SILVER u1)
+(define-constant TIER_GOLD u2)
+(define-constant TIER_PLATINUM u3)
+
+;; Tier thresholds (in days of staking)
+(define-constant TIER_SILVER_DAYS u30)
+(define-constant TIER_GOLD_DAYS u90)
+(define-constant TIER_PLATINUM_DAYS u180)
+
 ;; ========================================
 ;; Data Variables
 ;; ========================================
@@ -37,6 +49,8 @@
 (define-data-var total-rewards-distributed uint u0)
 (define-data-var total-fees-collected uint u0)
 (define-data-var total-stakers uint u0)
+(define-data-var loyalty-enabled bool true)
+(define-data-var total-tier-upgrades uint u0)
 
 ;; ========================================
 ;; Data Maps
@@ -89,6 +103,29 @@
 
 ;; Track unique stakers
 (define-map registered-stakers principal bool)
+
+;; Loyalty tiers
+(define-map loyalty-tiers
+    { pool-id: uint, staker: principal }
+    {
+        current-tier: uint,
+        tier-since: uint,
+        total-bonus-earned: uint,
+        fee-discount-used: uint,
+        last-tier-check: uint
+    }
+)
+
+;; Tier benefits configuration
+(define-map tier-benefits
+    uint
+    {
+        name: (string-ascii 32),
+        reward-bonus-bps: uint,
+        fee-discount-bps: uint,
+        min-days-staked: uint
+    }
+)
 
 ;; ========================================
 ;; Read-Only Functions
@@ -151,8 +188,52 @@
         total-rewards: (var-get total-rewards-distributed),
         total-fees: (var-get total-fees-collected),
         total-stakers: (var-get total-stakers),
+        loyalty-enabled: (var-get loyalty-enabled),
+        total-tier-upgrades: (var-get total-tier-upgrades),
         current-time: stacks-block-time
     })
+
+(define-read-only (get-loyalty-tier (pool-id uint) (staker principal))
+    (map-get? loyalty-tiers { pool-id: pool-id, staker: staker }))
+
+(define-read-only (get-tier-benefits (tier uint))
+    (map-get? tier-benefits tier))
+
+(define-private (get-tier-from-days (days-staked uint))
+    (if (>= days-staked TIER_PLATINUM_DAYS)
+        TIER_PLATINUM
+        (if (>= days-staked TIER_GOLD_DAYS)
+            TIER_GOLD
+            (if (>= days-staked TIER_SILVER_DAYS)
+                TIER_SILVER
+                TIER_BRONZE))))
+
+(define-read-only (calculate-current-tier (pool-id uint) (staker principal))
+    (match (map-get? stakes { pool-id: pool-id, staker: staker })
+        stake (let
+            (
+                (current-time stacks-block-time)
+                (staked-at (get staked-at stake))
+                (days-staked (/ (- current-time staked-at) ONE_DAY))
+            )
+            (get-tier-from-days days-staked))
+        TIER_BRONZE))
+
+(define-private (calculate-tier-bonus-private (base-rewards uint) (tier uint))
+    (match (map-get? tier-benefits tier)
+        benefits (/ (* base-rewards (get reward-bonus-bps benefits)) u10000)
+        u0))
+
+(define-private (calculate-tier-fee-discount-private (base-fee uint) (tier uint))
+    (match (map-get? tier-benefits tier)
+        benefits (/ (* base-fee (get fee-discount-bps benefits)) u10000)
+        u0))
+
+(define-read-only (calculate-tier-bonus (base-rewards uint) (tier uint))
+    (calculate-tier-bonus-private base-rewards tier))
+
+(define-read-only (calculate-tier-fee-discount (base-fee uint) (tier uint))
+    (calculate-tier-fee-discount-private base-fee tier))
 
 ;; Generate pool info using to-ascii?
 (define-read-only (generate-pool-info (pool-id uint))
@@ -574,6 +655,212 @@
         
         (ok net-rewards)))
 
+;; Initialize tier benefits (admin only)
+(define-public (initialize-tier-benefits)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+
+        (map-set tier-benefits TIER_BRONZE {
+            name: "Bronze",
+            reward-bonus-bps: u0,
+            fee-discount-bps: u0,
+            min-days-staked: u0
+        })
+
+        (map-set tier-benefits TIER_SILVER {
+            name: "Silver",
+            reward-bonus-bps: u500,
+            fee-discount-bps: u2500,
+            min-days-staked: TIER_SILVER_DAYS
+        })
+
+        (map-set tier-benefits TIER_GOLD {
+            name: "Gold",
+            reward-bonus-bps: u1000,
+            fee-discount-bps: u5000,
+            min-days-staked: TIER_GOLD_DAYS
+        })
+
+        (map-set tier-benefits TIER_PLATINUM {
+            name: "Platinum",
+            reward-bonus-bps: u2000,
+            fee-discount-bps: u7500,
+            min-days-staked: TIER_PLATINUM_DAYS
+        })
+
+        (print {
+            event: "tier-benefits-initialized",
+            timestamp: stacks-block-time
+        })
+
+        (ok true)))
+
+;; Check and upgrade tier
+(define-public (check-and-upgrade-tier (pool-id uint))
+    (let
+        (
+            (caller tx-sender)
+            (stake (unwrap! (map-get? stakes { pool-id: pool-id, staker: caller }) ERR_INSUFFICIENT_STAKE))
+            (current-time stacks-block-time)
+            (staked-at (get staked-at stake))
+            (days-staked (/ (- current-time staked-at) ONE_DAY))
+            (current-tier-level (get-tier-from-days days-staked))
+            (existing-tier (map-get? loyalty-tiers { pool-id: pool-id, staker: caller }))
+        )
+        (asserts! (var-get loyalty-enabled) ERR_NOT_AUTHORIZED)
+
+        (match existing-tier
+            tier-data
+                (if (> current-tier-level (get current-tier tier-data))
+                    (begin
+                        (map-set loyalty-tiers { pool-id: pool-id, staker: caller } (merge tier-data {
+                            current-tier: current-tier-level,
+                            tier-since: current-time,
+                            last-tier-check: current-time
+                        }))
+                        (var-set total-tier-upgrades (+ (var-get total-tier-upgrades) u1))
+                        (print {
+                            event: "tier-upgraded",
+                            pool-id: pool-id,
+                            staker: caller,
+                            old-tier: (get current-tier tier-data),
+                            new-tier: current-tier-level,
+                            timestamp: current-time
+                        })
+                        (ok true))
+                    (begin
+                        (map-set loyalty-tiers { pool-id: pool-id, staker: caller } (merge tier-data {
+                            last-tier-check: current-time
+                        }))
+                        (ok false)))
+            (begin
+                (map-set loyalty-tiers { pool-id: pool-id, staker: caller } {
+                    current-tier: current-tier-level,
+                    tier-since: current-time,
+                    total-bonus-earned: u0,
+                    fee-discount-used: u0,
+                    last-tier-check: current-time
+                })
+                (print {
+                    event: "tier-initialized",
+                    pool-id: pool-id,
+                    staker: caller,
+                    tier: current-tier-level,
+                    timestamp: current-time
+                })
+                (ok true)))))
+
+;; Claim rewards with tier bonuses
+(define-public (claim-rewards-with-tier-bonus (pool-id uint))
+    (let
+        (
+            (caller tx-sender)
+            (pool (unwrap! (map-get? pools pool-id) ERR_POOL_NOT_FOUND))
+            (stake (unwrap! (map-get? stakes { pool-id: pool-id, staker: caller }) ERR_INSUFFICIENT_STAKE))
+            (current-time stacks-block-time)
+            (staked-at (get staked-at stake))
+            (days-staked (/ (- current-time staked-at) ONE_DAY))
+            (current-tier (get-tier-from-days days-staked))
+            (time-staked (- current-time (get last-claim stake)))
+            (daily-rate (get reward-rate pool))
+            (stake-amount (get amount stake))
+            (base-rewards (/ (* (* stake-amount daily-rate) time-staked) (* u10000 ONE_DAY)))
+            (tier-bonus (if (var-get loyalty-enabled)
+                           (calculate-tier-bonus-private base-rewards current-tier)
+                           u0))
+            (total-rewards (+ base-rewards tier-bonus))
+            (base-fee (calculate-reward-fee total-rewards))
+            (fee-discount (if (var-get loyalty-enabled)
+                             (calculate-tier-fee-discount-private base-fee current-tier)
+                             u0))
+            (net-fee (- base-fee fee-discount))
+            (net-rewards (- total-rewards net-fee))
+            (tier-data (map-get? loyalty-tiers { pool-id: pool-id, staker: caller }))
+        )
+        ;; Validations
+        (asserts! (> base-rewards u0) ERR_NO_REWARDS)
+        (asserts! (<= total-rewards (get reward-pool-balance pool)) ERR_NO_REWARDS)
+
+        ;; Transfer rewards to staker
+        (try! (stx-transfer? net-rewards (var-get contract-principal) caller))
+
+        ;; Transfer fee to protocol
+        (try! (stx-transfer? net-fee (var-get contract-principal) CONTRACT_OWNER))
+
+        ;; Update stake
+        (map-set stakes { pool-id: pool-id, staker: caller } (merge stake {
+            last-claim: current-time,
+            rewards-earned: (+ (get rewards-earned stake) net-rewards)
+        }))
+
+        ;; Update pool
+        (map-set pools pool-id (merge pool {
+            total-rewards-paid: (+ (get total-rewards-paid pool) total-rewards),
+            reward-pool-balance: (- (get reward-pool-balance pool) total-rewards)
+        }))
+
+        ;; Update loyalty tier stats
+        (match tier-data
+            tier (map-set loyalty-tiers { pool-id: pool-id, staker: caller } (merge tier {
+                total-bonus-earned: (+ (get total-bonus-earned tier) tier-bonus),
+                fee-discount-used: (+ (get fee-discount-used tier) fee-discount)
+            }))
+            true)
+
+        ;; Update global stats
+        (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) net-rewards))
+        (var-set total-fees-collected (+ (var-get total-fees-collected) net-fee))
+
+        ;; Update user stats
+        (match (map-get? user-stats caller)
+            stats (map-set user-stats caller (merge stats {
+                total-rewards-earned: (+ (get total-rewards-earned stats) net-rewards),
+                total-fees-paid: (+ (get total-fees-paid stats) net-fee),
+                last-activity: current-time
+            }))
+            true)
+
+        ;; EMIT EVENT: rewards-claimed-with-bonus
+        (print {
+            event: "rewards-claimed-with-tier-bonus",
+            pool-id: pool-id,
+            staker: caller,
+            base-rewards: base-rewards,
+            tier-bonus: tier-bonus,
+            total-rewards: total-rewards,
+            tier: current-tier,
+            base-fee: base-fee,
+            fee-discount: fee-discount,
+            net-fee: net-fee,
+            net-rewards: net-rewards,
+            timestamp: current-time
+        })
+
+        ;; EMIT EVENT: fee-collected
+        (print {
+            event: "fee-collected",
+            pool-id: pool-id,
+            fee-type: "reward-with-tier",
+            amount: net-fee,
+            discount-applied: fee-discount,
+            staker: caller,
+            timestamp: current-time
+        })
+
+        (ok { net-rewards: net-rewards, tier-bonus: tier-bonus, fee-discount: fee-discount })))
+
+;; Toggle loyalty program
+(define-public (toggle-loyalty-program)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (var-set loyalty-enabled (not (var-get loyalty-enabled)))
+        (print {
+            event: "loyalty-program-toggled",
+            enabled: (var-get loyalty-enabled),
+            timestamp: stacks-block-time
+        })
+        (ok (var-get loyalty-enabled))))
+
 ;; ========================================
 ;; Admin Functions
 ;; ========================================
@@ -593,8 +880,3 @@
         (map-set pools pool-id (merge pool { status: POOL_ACTIVE }))
         (print { event: "pool-resumed", pool-id: pool-id, timestamp: stacks-block-time })
         (ok true)))
-(define-data-var staking-var-1 uint u1)
-(define-data-var staking-var-2 uint u2)
-(define-data-var staking-var-3 uint u3)
-(define-data-var staking-var-4 uint u4)
-(define-data-var staking-var-5 uint u5)
