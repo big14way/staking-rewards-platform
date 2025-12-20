@@ -1008,3 +1008,26 @@
         total-auto-compounds: (var-get total-auto-compounds),
         total-amount-compounded: (var-get total-auto-compound-amount)
     })
+
+;; Emergency withdrawal with penalty
+(define-constant ERR_EMERGENCY_COOLDOWN (err u23011))
+(define-data-var emergency-withdrawal-enabled bool true)
+(define-data-var emergency-penalty-bps uint u1000)
+
+(define-public (emergency-withdraw-stake (pool-id uint))
+    (let ((stake (unwrap! (map-get? stakes { pool-id: pool-id, staker: tx-sender }) ERR_INSUFFICIENT_STAKE))
+          (pool (unwrap! (map-get? pools pool-id) ERR_POOL_NOT_FOUND))
+          (amount (get amount stake))
+          (penalty (/ (* amount (var-get emergency-penalty-bps)) u10000))
+          (net-amount (- amount penalty)))
+        (asserts! (var-get emergency-withdrawal-enabled) ERR_NOT_AUTHORIZED)
+        (asserts! (> amount u0) ERR_INSUFFICIENT_STAKE)
+        (try! (stx-transfer? net-amount (var-get contract-principal) tx-sender))
+        (map-delete stakes { pool-id: pool-id, staker: tx-sender })
+        (map-set pools pool-id (merge pool { total-staked: (- (get total-staked pool) amount) }))
+        (var-set total-staked (- (var-get total-staked) amount))
+        (print { event: "emergency-withdrawal", pool-id: pool-id, staker: tx-sender, amount: net-amount, penalty: penalty, timestamp: stacks-block-time })
+        (ok net-amount)))
+
+(define-read-only (calculate-emergency-penalty (amount uint))
+    (/ (* amount (var-get emergency-penalty-bps)) u10000))
