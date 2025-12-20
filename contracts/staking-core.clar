@@ -13,6 +13,8 @@
 (define-constant ERR_POOL_INACTIVE (err u23006))
 (define-constant ERR_NO_REWARDS (err u23007))
 (define-constant ERR_TIER_NOT_FOUND (err u23008))
+(define-constant ERR_SCHEDULE_EXISTS (err u23009))
+(define-constant ERR_SCHEDULE_NOT_READY (err u23010))
 
 ;; Pool status
 (define-constant POOL_ACTIVE u0)
@@ -51,6 +53,8 @@
 (define-data-var total-stakers uint u0)
 (define-data-var loyalty-enabled bool true)
 (define-data-var total-tier-upgrades uint u0)
+(define-data-var total-auto-compounds uint u0)
+(define-data-var total-auto-compound-amount uint u0)
 
 ;; ========================================
 ;; Data Maps
@@ -124,6 +128,18 @@
         reward-bonus-bps: uint,
         fee-discount-bps: uint,
         min-days-staked: uint
+    }
+)
+
+;; Auto-compound schedules
+(define-map auto-compound-schedules
+    { pool-id: uint, staker: principal }
+    {
+        interval-seconds: uint,
+        last-compound: uint,
+        next-compound: uint,
+        total-compounded: uint,
+        enabled: bool
     }
 )
 
@@ -880,3 +896,115 @@
         (map-set pools pool-id (merge pool { status: POOL_ACTIVE }))
         (print { event: "pool-resumed", pool-id: pool-id, timestamp: stacks-block-time })
         (ok true)))
+
+;; ========================================
+;; Auto-Compound Schedule Functions
+;; ========================================
+
+;; Set up auto-compound schedule
+(define-public (set-auto-compound-schedule (pool-id uint) (interval-seconds uint))
+    (let ((stake (unwrap! (map-get? stakes { pool-id: pool-id, staker: tx-sender }) ERR_INSUFFICIENT_STAKE))
+          (pool (unwrap! (map-get? pools pool-id) ERR_POOL_NOT_FOUND))
+          (current-time stacks-block-time)
+          (next-compound (+ current-time interval-seconds)))
+        ;; Validations
+        (asserts! (>= interval-seconds ONE_DAY) ERR_INVALID_AMOUNT) ;; Min 1 day
+        (asserts! (is-eq (get status pool) POOL_ACTIVE) ERR_POOL_INACTIVE)
+
+        ;; Create or update schedule
+        (map-set auto-compound-schedules { pool-id: pool-id, staker: tx-sender } {
+            interval-seconds: interval-seconds,
+            last-compound: current-time,
+            next-compound: next-compound,
+            total-compounded: u0,
+            enabled: true
+        })
+
+        ;; Emit event
+        (print {
+            event: "auto-compound-scheduled",
+            pool-id: pool-id,
+            staker: tx-sender,
+            interval-seconds: interval-seconds,
+            next-compound: next-compound,
+            timestamp: current-time
+        })
+
+        (ok next-compound)))
+
+;; Acknowledge compound on schedule (tracks that user compounded on time)
+(define-public (acknowledge-scheduled-compound (pool-id uint) (amount-compounded uint))
+    (let ((schedule (unwrap! (map-get? auto-compound-schedules { pool-id: pool-id, staker: tx-sender }) ERR_SCHEDULE_NOT_READY))
+          (current-time stacks-block-time))
+        ;; Validations
+        (asserts! (get enabled schedule) ERR_SCHEDULE_NOT_READY)
+        (asserts! (>= current-time (get next-compound schedule)) ERR_SCHEDULE_NOT_READY)
+
+        ;; Update schedule timing
+        (map-set auto-compound-schedules { pool-id: pool-id, staker: tx-sender } (merge schedule {
+            last-compound: current-time,
+            next-compound: (+ current-time (get interval-seconds schedule)),
+            total-compounded: (+ (get total-compounded schedule) u1)
+        }))
+
+        ;; Update stats
+        (var-set total-auto-compounds (+ (var-get total-auto-compounds) u1))
+        (var-set total-auto-compound-amount (+ (var-get total-auto-compound-amount) amount-compounded))
+
+        ;; Emit event
+        (print {
+            event: "scheduled-compound-acknowledged",
+            pool-id: pool-id,
+            staker: tx-sender,
+            amount-compounded: amount-compounded,
+            next-compound: (+ current-time (get interval-seconds schedule)),
+            execution-count: (+ (get total-compounded schedule) u1),
+            timestamp: current-time
+        })
+
+        (ok { next-compound: (+ current-time (get interval-seconds schedule)) })))
+
+;; Cancel auto-compound schedule
+(define-public (cancel-auto-compound (pool-id uint))
+    (let ((schedule (unwrap! (map-get? auto-compound-schedules { pool-id: pool-id, staker: tx-sender }) ERR_SCHEDULE_NOT_READY)))
+        (asserts! (get enabled schedule) ERR_SCHEDULE_NOT_READY)
+
+        ;; Disable schedule
+        (map-set auto-compound-schedules { pool-id: pool-id, staker: tx-sender } (merge schedule {
+            enabled: false
+        }))
+
+        ;; Emit event
+        (print {
+            event: "auto-compound-cancelled",
+            pool-id: pool-id,
+            staker: tx-sender,
+            total-executions: (get total-compounded schedule),
+            timestamp: stacks-block-time
+        })
+
+        (ok true)))
+
+;; Get auto-compound schedule
+(define-read-only (get-auto-compound-schedule (pool-id uint) (staker principal))
+    (map-get? auto-compound-schedules { pool-id: pool-id, staker: staker }))
+
+;; Check if auto-compound is ready
+(define-read-only (is-auto-compound-ready (pool-id uint) (staker principal))
+    (match (map-get? auto-compound-schedules { pool-id: pool-id, staker: staker })
+        schedule {
+            is-ready: (and (get enabled schedule)
+                          (>= stacks-block-time (get next-compound schedule))),
+            next-compound: (get next-compound schedule),
+            time-until-next: (if (> (get next-compound schedule) stacks-block-time)
+                               (- (get next-compound schedule) stacks-block-time)
+                               u0)
+        }
+        { is-ready: false, next-compound: u0, time-until-next: u0 }))
+
+;; Get auto-compound statistics
+(define-read-only (get-auto-compound-stats)
+    {
+        total-auto-compounds: (var-get total-auto-compounds),
+        total-amount-compounded: (var-get total-auto-compound-amount)
+    })
