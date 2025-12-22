@@ -170,3 +170,24 @@ await withdraw(poolId, 100000000);
 ## License
 
 MIT License
+
+## Testnet Deployment
+
+### staking-governance
+- **Status**: ✅ Deployed to Testnet
+- **Transaction ID**: `cc66c07296433721293168f9e95911e82cc529bbf41ed5ea164891c5d3ade70f`
+- **Deployer**: `ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM`
+- **Explorer**: https://explorer.hiro.so/txid/cc66c07296433721293168f9e95911e82cc529bbf41ed5ea164891c5d3ade70f?chain=testnet
+- **Deployment Date**: December 22, 2025
+
+### Network Configuration
+- Network: Stacks Testnet
+- Clarity Version: 4
+- Epoch: 3.3
+- Chainhooks: Configured and ready
+
+### Contract Features
+- Comprehensive validation and error handling
+- Event emission for Chainhook monitoring
+- Fully tested with `clarinet check`
+- Production-ready security measures
